@@ -1,5 +1,5 @@
 import { promises as fs } from "fs";
-import { join } from "path";
+import { join, resolve } from "path";
 import { loadConfig, updateConfig } from "./config";
 import { getMockResponse } from "./har-parser";
 import { PDFDocument } from "pdf-lib";
@@ -40,6 +40,16 @@ export function broadcastProgress(
   }
 }
 
+function parseYuketangJson(text: string): any {
+  return JSON.parse(text, (_key, value, context?: { source?: string }) => {
+    // Lesson IDs can exceed JavaScript's safe integer range; retain their exact digits.
+    if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value) && context?.source) {
+      return context.source;
+    }
+    return value;
+  });
+}
+
 async function fetchFromYuketang(urlStr: string): Promise<any> {
   const config = await loadConfig();
   if (config.offlineMode) {
@@ -47,7 +57,7 @@ async function fetchFromYuketang(urlStr: string): Promise<any> {
     if (!mock) {
       throw new Error(`Offline cache miss for YuKeTang URL: ${urlStr}`);
     }
-    return JSON.parse(mock.text);
+    return parseYuketangJson(mock.text);
   }
 
   const cookies = config.cookies;
@@ -68,14 +78,19 @@ async function fetchFromYuketang(urlStr: string): Promise<any> {
       "cookie": cookieHeader.join("; "),
       "x-csrftoken": cookies.csrftoken,
       "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "referer": "https://www.yuketang.cn/"
+      "referer": "https://www.yuketang.cn/",
+      "xtbz": cookies.xtbz || "ykt",
+      "university-id": cookies.university_id || "",
+      "platform-id": cookies.platform_id || "3",
+      "x-client": "web",
+      "terminal-type": "web"
     }
   });
 
   if (!res.ok) {
     throw new Error(`Failed to fetch from YuKeTang, status: ${res.status}`);
   }
-  return await res.json();
+  return parseYuketangJson(await res.text());
 }
 
 async function refreshXuetangxAuth(classroomId: string, examId: string): Promise<string> {
@@ -295,6 +310,19 @@ async function resolveLessonId(
   leafType: number
 ): Promise<string> {
   if (leafType === 8) {
+    // Leaf and activity titles may differ after a lesson is renamed.
+    try {
+      const leafUrl = `https://www.yuketang.cn/mooc-api/v1/lms/learn/leaf_info/${classroomId}/${leafId}/?classroom_id=${classroomId}`;
+      const leafData = await fetchFromYuketang(leafUrl);
+      const leaf = leafData.data;
+      const mappedId = leaf?.content_info?.leaf_type_id;
+      if (leafData.success !== false && leaf?.leaf_type === 8 && String(leaf.id) === String(leafId) && mappedId && /^\d+$/.test(String(mappedId))) {
+        console.log(`[Downloader] Resolved leaf ${leafId} to lessonId ${mappedId} via leaf details`);
+        return String(mappedId);
+      }
+    } catch (err: any) {
+      console.warn(`[Downloader] Could not resolve leaf details:`, err.message || err);
+    }
     const match = await findActivityInLogs(classroomId, leafTitle, [14]);
     if (match) {
       console.log(`[Downloader] Resolved leaf ${leafId} (${leafTitle}) to lessonId ${match.courseware_id} via logs`);
@@ -328,7 +356,7 @@ export async function downloadLesson(
     if (leafType === 5 || leafType === 9) {
       const cleanCourse = cleanFilename(courseName);
       const cleanTitle = cleanFilename(lessonTitle);
-      const targetDir = join(process.cwd(), config.downloadDir, cleanCourse, `${String(lessonIndex).padStart(2, "0")}_${cleanTitle}`);
+      const targetDir = join(resolve(config.downloadDir), cleanCourse, `${String(lessonIndex).padStart(2, "0")}_${cleanTitle}`);
       await fs.mkdir(targetDir, { recursive: true });
 
       // Refresh XuetangX authentication automatically
@@ -530,7 +558,7 @@ export async function downloadLesson(
 
     const cleanCourse = cleanFilename(courseName);
     const cleanTitle = cleanFilename(lessonTitle);
-    const courseDir = join(process.cwd(), config.downloadDir, cleanCourse);
+    const courseDir = join(resolve(config.downloadDir), cleanCourse);
     const problemDir = join(courseDir, "problem");
     await fs.mkdir(problemDir, { recursive: true });
 
@@ -632,9 +660,7 @@ export async function downloadLesson(
     }
 
     if (presentationsMap.size === 0) {
-      console.warn(`[Downloader] Lesson ${lessonId} has no slides.`);
-      broadcastProgress(lessonId, 100, "0 KB/s", "completed");
-      return;
+      throw new Error(`Lesson ${lessonId}: no downloadable slides were returned by the API.`);
     }
 
     // Determine the order of presentations based on display sequence

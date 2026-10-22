@@ -123,8 +123,8 @@ export const offlinePlugin = new Elysia()
     return { success: true, offlineMode: updated.offlineMode };
   })
 
-  // 3. Global onBeforeHandle hook to intercept live APIs and serve mock data when offline, or proxy when online
-  .onBeforeHandle({ as: "global" }, async ({ request, set }) => {
+  // 3. Intercept upstream APIs before routing and body parsing, including unregistered paths
+  .onRequest(async ({ request, set }) => {
     const config = await loadConfig();
     const urlObj = new URL(request.url);
     const pathname = urlObj.pathname;
